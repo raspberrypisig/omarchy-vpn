@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.bak*
+*.ovpn
+*.key
+*.pem
+*.p12

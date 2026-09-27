@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "adarsh.vpn",
+  "name": "Omarchy VPN",
+  "version": "1.3.0",
+  "author": "Adarsh",
+  "homepage": "https://github.com/TheComputeCenter/omarchy-vpn",
+  "repository": "https://github.com/TheComputeCenter/omarchy-vpn",
+  "license": "MIT",
+  "description": "Import, save, and connect OpenVPN profiles with NetworkManager.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "VpnWidget.qml"},
+  "barWidget": {
+    "displayName": "VPN",
+    "description": "Import .ovpn files and switch saved VPN connections.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
