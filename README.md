@@ -128,6 +128,13 @@ use one configuration with inline data or explicit file references instead.
 Each source/asset file is limited to 16 MiB. NetworkManager determines which
 OpenVPN options are supported.
 
+When NetworkManager refuses an import, the widget shows its own reason rather
+than a generic failure. A missing `networkmanager-openvpn` package is reported as
+such, and other rejections show the first diagnostic line with certificate,
+key-sized, and credential values redacted. Reproduce one without the panel using
+`nmcli connection import type openvpn file <path>`, and delete the connection
+afterwards if it was created.
+
 VPNs requiring usernames, passwords, MFA, or encrypted-key passphrases may need
 configuration through NetworkManager and a desktop secret agent. Importing a
 file does not guarantee its authentication details are complete. The plugin
@@ -137,9 +144,14 @@ Keep the saved profile files while their NetworkManager connections exist.
 Routine plugin code updates/removal do not delete saved files or connections.
 A requested fresh setup can clear all tracked profiles using
 `python3 scripts/vpn.py reset`; it never discovers or migrates existing system
-VPNs. This reset removes plugin-imported connections and saved copies. Failed
-or timed-out NetworkManager imports retain their archived files for recovery,
-because the connection may have been created before the response was lost.
+VPNs. This reset removes plugin-imported connections and saved copies.
+
+To clear only abandoned material, without touching saved profiles, run
+`python3 scripts/vpn.py sweep`. It deletes archived directories that neither
+`state.json` nor a NetworkManager connection refers to and prints the removed
+names under `swept`. Imports already do this automatically; a directory
+NetworkManager still points at is always kept, because the connection may have
+been created before an import response was lost.
 
 ## Dependencies
 
@@ -173,10 +185,11 @@ omarchy plugin validate .
 
 The tests use fake package commands and mocked NetworkManager calls. They cover
 missing dependencies, private file permissions, certificate copying, persistence,
-profile selection, cancellation, and import failures. They never install packages
-or change network settings. The running panel and a live split-tunnel VPN
-connection were also checked on Omarchy 4.0.4; other providers may require
-additional authentication or DNS setup.
+profile selection, cancellation, import failures, NetworkManager diagnostics, and
+sweeping abandoned key material. They never install packages or change network
+settings. The running panel and a live split-tunnel VPN connection were also
+checked on Omarchy 4.0.4; other providers may require additional authentication
+or DNS setup.
 
 ## License
 

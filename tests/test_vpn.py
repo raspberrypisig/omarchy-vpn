@@ -96,6 +96,70 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(vpn.load_state(self.root), original)
         self.assertEqual(len(list((self.root / 'profiles').iterdir())), 2)
 
+    def test_failed_import_removes_key_material_nothing_references(self):
+        with patch.object(vpn, 'nmcli', side_effect=[vpn.VpnError('Import failed'), '']):
+            with self.assertRaises(vpn.VpnError):
+                vpn.import_profile(self.root, self.source)
+        self.assertEqual(list((self.root / 'profiles').iterdir()), [])
+        self.assertEqual(vpn.load_state(self.root), {'selected': '', 'profiles': []})
+
+    def test_failed_import_keeps_files_a_lost_response_may_have_registered(self):
+        def command(*args, **kwargs):
+            if args[0:2] == ('connection', 'show'):
+                return ''.join(str(path) + '\n' for path in (self.root / 'profiles').iterdir())
+            raise vpn.VpnError('NetworkManager timed out.')
+
+        with patch.object(vpn, 'nmcli', side_effect=command):
+            with self.assertRaises(vpn.VpnError):
+                vpn.import_profile(self.root, self.source)
+        self.assertEqual(len(list((self.root / 'profiles').iterdir())), 1)
+
+    def test_later_import_sweeps_directories_earlier_failures_left_behind(self):
+        stale = self.root / 'profiles' / 'profile-abandoned'
+        stale.mkdir(parents=True)
+        (stale / 'asset-0.dat').write_text('PRIVATE TEST DATA')
+        with patch.object(vpn, 'nmcli', return_value=f'Connection ({UUID1})') as command:
+            vpn.import_profile(self.root, self.source)
+        self.assertEqual(command.call_args_list[0].args, ('connection', 'show'))
+        self.assertFalse(stale.exists())
+        self.assertTrue(Path(vpn.load_state(self.root)['profiles'][0]['directory']).is_dir())
+
+    def test_sweep_removes_saved_directories_and_ignores_unrelated_entries(self):
+        self.import_sample()
+        other = self.root / 'profiles' / 'notes.txt'
+        other.write_text('not a profile')
+        with patch.object(vpn, 'nmcli', return_value='') as command:
+            vpn.reset_profiles(self.root)
+        self.assertTrue(other.exists())
+        self.assertEqual([entry.name for entry in (self.root / 'profiles').iterdir()], ['notes.txt'])
+
+    def test_sweep_keeps_the_tracked_profile_and_reports_what_it_removed(self):
+        profile = self.import_sample()
+        stale = self.root / 'profiles' / 'profile-abandoned'
+        stale.mkdir(parents=True)
+        (stale / 'asset-0.dat').write_text('PRIVATE TEST DATA')
+        with patch.object(vpn, 'nmcli', return_value='') as command:
+            self.assertEqual(vpn.sweep_profiles(self.root), ['profile-abandoned'])
+        self.assertFalse(stale.exists())
+        self.assertTrue(Path(profile['directory']).is_dir())
+        self.assertEqual(vpn.load_state(self.root)['selected'], UUID1)
+
+    def test_sweep_action_leaves_saved_profiles_in_the_reported_status(self):
+        profile = self.import_sample()
+        stale = self.root / 'profiles' / 'profile-abandoned'
+        stale.mkdir(parents=True)
+        with patch.object(vpn, 'data_root', return_value=self.root), \
+                patch('sys.argv', ['vpn.py', 'sweep']), \
+                patch.object(vpn, 'nmcli', return_value=''), \
+                io.StringIO() as output, contextlib.redirect_stdout(output):
+            code = vpn.main()
+            printed = json.loads(output.getvalue())
+        self.assertEqual(code, 0)
+        self.assertEqual(printed['swept'], ['profile-abandoned'])
+        self.assertEqual(printed['profiles'][0]['uuid'], UUID1)
+        self.assertTrue(Path(profile['directory']).is_dir())
+        self.assertFalse(stale.exists())
+
     def test_multi_profile_selection_and_active_filtering(self):
         self.import_sample()
         self.import_sample(UUID2)
@@ -132,6 +196,38 @@ class ProfileTests(unittest.TestCase):
             with self.assertRaises(vpn.VpnError) as error:
                 vpn.nmcli('connection', 'import')
         self.assertNotIn('private-secret', str(error.exception))
+
+    def test_nm_failure_reports_the_actual_reason(self):
+        response = subprocess.CompletedProcess([], 1, '', 'Error: <ca>:error:0480006A:asn1 encoding routines::CMS decryption failed')
+        with patch.object(vpn.subprocess, 'run', return_value=response):
+            with self.assertRaises(vpn.VpnError) as error:
+                vpn.nmcli('connection', 'import', 'file', '/tmp/a.ovpn')
+        self.assertIn('CMS decryption failed', str(error.exception))
+
+    def test_missing_openvpn_support_names_the_package(self):
+        response = subprocess.CompletedProcess([], 1, '', 'Error: failed to load VPN plugin: unknown VPN plugin "org.freedesktop.NetworkManager.openvpn".')
+        with patch.object(vpn.subprocess, 'run', return_value=response):
+            with self.assertRaises(vpn.VpnError) as error:
+                vpn.nmcli('connection', 'import', 'file', '/tmp/a.ovpn')
+        self.assertIn('networkmanager-openvpn', str(error.exception))
+
+    def test_failure_without_diagnostics_keeps_generic_guidance(self):
+        response = subprocess.CompletedProcess([], 1, '', '   \n')
+        with patch.object(vpn.subprocess, 'run', return_value=response):
+            with self.assertRaises(vpn.VpnError) as error:
+                vpn.nmcli('connection', 'import')
+        self.assertIn('Check the VPN file', str(error.exception))
+
+    def test_certificate_material_in_diagnostics_is_redacted(self):
+        payload = 'MIIDdzCCAl+gAwIBAgIEAAAABDAKBggqhkjOPQQDAjA='
+        response = subprocess.CompletedProcess([], 1, '', f'Error: cannot parse -----BEGIN CERTIFICATE-----{payload}-----END CERTIFICATE-----')
+        with patch.object(vpn.subprocess, 'run', return_value=response):
+            with self.assertRaises(vpn.VpnError) as error:
+                vpn.nmcli('connection', 'import')
+        message = str(error.exception)
+        self.assertNotIn(payload, message)
+        self.assertNotIn('BEGIN CERTIFICATE', message)
+        self.assertIn('cannot parse', message)
 
     def test_subprocess_arguments_are_not_shell_interpolated(self):
         response = subprocess.CompletedProcess([], 0, 'OK', '')

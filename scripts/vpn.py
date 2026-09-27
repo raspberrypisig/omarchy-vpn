@@ -20,6 +20,12 @@ FILE_OPTIONS = {
 }
 INLINE_OPTIONS = FILE_OPTIONS | {'auth-gen-token-secret'}
 MAX_FILE_BYTES = 16 * 1024 * 1024
+GENERIC_FAILURE = 'NetworkManager could not complete the request. Check the VPN file, permissions, and any required login credentials.'
+MISSING_OPENVPN = re.compile(r'unknown VPN plugin "org\.freedesktop\.NetworkManager\.openvpn"')
+PEM_BLOCK = re.compile(r'-{4,}.*?-{4,}')
+SECRET_ASSIGNMENT = re.compile(r'(?i)\b(pass(?:word|phrase)?|secret|token|pin|credential)s?\b\s*[:=]?\s*"?([^\s"]+)"?')
+OPAQUE_TOKEN = re.compile(r'[A-Za-z0-9+/=_-]{24,}')
+MAX_DETAIL = 160
 
 
 class VpnError(Exception):
@@ -85,6 +91,26 @@ def save_state(root, state):
         Path(filename).unlink(missing_ok=True)
 
 
+def nm_failure(output):
+    # nmcli can quote the parsed configuration or a credential back at us, so
+    # only the first line survives and every opaque run is redacted.
+    for line in (output or '').splitlines():
+        detail = line.strip()
+        if detail:
+            break
+    else:
+        return GENERIC_FAILURE
+    if MISSING_OPENVPN.search(output):
+        return 'NetworkManager has no OpenVPN support installed. On Arch install networkmanager-openvpn, then try again.'
+    detail = PEM_BLOCK.sub('[redacted]', detail)
+    detail = SECRET_ASSIGNMENT.sub(lambda match: match.group(1) + '=[redacted]', detail)
+    detail = OPAQUE_TOKEN.sub('[redacted]', detail)
+    detail = detail.removeprefix('**nmcli**').removeprefix('Error:').strip()
+    if len(detail) > MAX_DETAIL:
+        detail = detail[:MAX_DETAIL].rstrip() + '…'
+    return f'NetworkManager rejected this request: {detail}' if detail else GENERIC_FAILURE
+
+
 def nmcli(*args, timeout=40):
     try:
         result = subprocess.run(
@@ -96,8 +122,7 @@ def nmcli(*args, timeout=40):
     except subprocess.TimeoutExpired:
         raise VpnError('NetworkManager timed out. Check its connection list before trying again.') from None
     if result.returncode:
-        # nmcli may include file contents or credentials in parser diagnostics.
-        raise VpnError('NetworkManager could not complete the request. Check the VPN file, permissions, and any required login credentials.')
+        raise VpnError(nm_failure(result.stderr or result.stdout))
     return result.stdout
 
 
@@ -152,6 +177,30 @@ def archive_config(source, destination):
     return prepared
 
 
+def prune_orphans(root, state):
+    # An import can succeed even when its response is lost, so a directory that
+    # NetworkManager still points at is kept. Anything else is key material
+    # nothing refers to any more.
+    profiles_dir = root / 'profiles'
+    if profiles_dir.is_symlink() or not profiles_dir.is_dir():
+        return []
+    known = {Path(profile['directory']) for profile in state['profiles'] if profile.get('directory')}
+    stale = [entry for entry in profiles_dir.iterdir()
+             if entry.name.startswith('profile-') and not entry.is_symlink() and entry not in known]
+    if not stale:
+        return []
+    try:
+        registered = nmcli('connection', 'show')
+    except VpnError:
+        return []
+    removed = []
+    for entry in stale:
+        if str(entry) not in registered:
+            shutil.rmtree(entry, ignore_errors=True)
+            removed.append(entry.name)
+    return removed
+
+
 def profile_name(name):
     name = (name or '').strip()
     if not name or len(name) > 64 or any(unicodedata.category(char).startswith('C') for char in name):
@@ -167,22 +216,25 @@ def import_profile(root, source, name=None, split_tunnel=True):
     state = load_state(root)
     profiles_dir = root / 'profiles'
     private_dir(profiles_dir)
+    prune_orphans(root, state)
     destination = Path(tempfile.mkdtemp(prefix='profile-', dir=profiles_dir))
     try:
         prepared = archive_config(source, destination)
     except Exception:
         shutil.rmtree(destination)
         raise
-    # Keep archived assets if NM fails or times out: an import could have
-    # completed before the response was lost. Never break that saved profile.
-    output = nmcli('connection', 'import', 'type', 'openvpn', 'file', str(prepared))
-    matches = UUID.findall(output)
-    if not matches:
-        raise VpnError('NetworkManager did not return the imported profile ID. The file is saved; check NetworkManager before importing again.')
-    profile = {'uuid': matches[-1].lower(), 'name': label, 'directory': str(destination), 'routingPending': True}
-    state['profiles'].append(profile)
-    state['selected'] = profile['uuid']
-    save_state(root, state)
+    try:
+        output = nmcli('connection', 'import', 'type', 'openvpn', 'file', str(prepared))
+        matches = UUID.findall(output)
+        if not matches:
+            raise VpnError('NetworkManager did not return the imported profile ID. The file is saved; check NetworkManager before importing again.')
+        profile = {'uuid': matches[-1].lower(), 'name': label, 'directory': str(destination), 'routingPending': True}
+        state['profiles'].append(profile)
+        state['selected'] = profile['uuid']
+        save_state(root, state)
+    except Exception:
+        prune_orphans(root, state)
+        raise
     # Record the imported profile before setting routing so failures leave it
     # recoverable. It cannot connect until routing configuration succeeds.
     configure_split(root, profile['uuid'], split_tunnel, newly_imported=True)
@@ -250,11 +302,17 @@ def remove_profile(root, selected):
     save_state(root, state)
 
 
+def sweep_profiles(root):
+    return prune_orphans(root, load_state(root))
+
+
 def reset_profiles(root):
     # Save progress after each removal; a failed deletion is safely retryable.
     for profile in list(load_state(root)['profiles']):
         remove_profile(root, profile['uuid'])
-    save_state(root, {'selected': '', 'profiles': []})
+    state = {'selected': '', 'profiles': []}
+    prune_orphans(root, state)
+    save_state(root, state)
 
 
 def status(root):
@@ -280,7 +338,7 @@ def status(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['status', 'import', 'select', 'rename', 'remove', 'reset', 'set-split', 'connect', 'disconnect'])
+    parser.add_argument('action', choices=['status', 'import', 'select', 'rename', 'remove', 'reset', 'sweep', 'set-split', 'connect', 'disconnect'])
     parser.add_argument('value', nargs='?')
     parser.add_argument('--name')
     parser.add_argument('--full-tunnel', action='store_true', help='Allow the VPN to supply the default internet route')
@@ -289,6 +347,7 @@ def main():
     try:
         root = data_root()
         private_dir(root)
+        removed = []
         with (root / '.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if args.action == 'import':
@@ -303,6 +362,8 @@ def main():
                 remove_profile(root, args.value)
             elif args.action == 'reset':
                 reset_profiles(root)
+            elif args.action == 'sweep':
+                removed = sweep_profiles(root)
             elif args.action == 'set-split':
                 configure_split(root, args.value, not args.full_tunnel)
             elif args.action in {'connect', 'disconnect'}:
@@ -313,6 +374,8 @@ def main():
                     raise VpnError('Set the split-tunneling option before connecting this imported profile.')
                 nmcli('connection', 'up' if args.action == 'connect' else 'down', 'uuid', state['selected'])
             result = status(root)
+            if removed:
+                result['swept'] = removed
         print(json.dumps(result))
         return 0
     except (VpnError, OSError) as exc:
