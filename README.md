@@ -10,7 +10,7 @@ internet access have been tested with a live OpenVPN connection.
 - Keep normal internet access with per-profile split tunneling.
 - Match Omarchy's theme and reveal the disconnected indicator on bar hover.
 
-Plugin ID: `adarsh.vpn`. Maintained by
+Plugin ID: `mohankumargupta.vpn`. Maintained by
 [TheComputeCenter](https://github.com/TheComputeCenter).
 
 ## Install
@@ -34,8 +34,8 @@ If you installed using `omarchy plugin add` or the marketplace command, run the
 dependency setup separately, then enable the plugin:
 
 ```bash
-bash ~/.config/omarchy/plugins/adarsh.vpn/scripts/setup-dependencies.sh --install
-omarchy plugin enable adarsh.vpn
+bash ~/.config/omarchy/plugins/mohankumargupta.vpn/scripts/setup-dependencies.sh --install
+omarchy plugin enable mohankumargupta.vpn
 ```
 
 Omarchy does not automatically execute dependency installation scripts. A
@@ -45,7 +45,7 @@ restart the system's network service.
 ## Update and remove
 
 ```bash
-omarchy plugin update adarsh.vpn
+omarchy plugin update mohankumargupta.vpn
 ```
 
 Updates preserve saved profiles. After an update, rerun dependency setup if the
@@ -55,7 +55,7 @@ reload it with `omarchy restart shell`.
 To remove only the widget:
 
 ```bash
-omarchy plugin remove adarsh.vpn
+omarchy plugin remove mohankumargupta.vpn
 ```
 
 To also delete the plugin's saved VPN profiles, run this **before** removing
@@ -63,14 +63,14 @@ the widget (it disconnects and deletes plugin-imported NetworkManager
 connections and their saved configuration copies):
 
 ```bash
-python3 ~/.config/omarchy/plugins/adarsh.vpn/scripts/vpn.py reset
-omarchy plugin remove adarsh.vpn
+python3 ~/.config/omarchy/plugins/mohankumargupta.vpn/scripts/vpn.py reset
+omarchy plugin remove mohankumargupta.vpn
 ```
 
 Your original source `.ovpn` files and externally created NetworkManager
 connections are not deleted. Dependency packages are left installed because
 other applications may use them. Saved profiles otherwise remain under
-`~/.local/share/adarsh.vpn/` and are reused if you reinstall; use the reset
+`~/.local/share/mohankumargupta.vpn/` and are reused if you reinstall; use the reset
 command above when you want a fresh start.
 
 ## Import and save a VPN
@@ -112,8 +112,8 @@ protected by that VPN when split tunneling is enabled.
 If route setup fails after import, the profile is retained for recovery and
 connecting is blocked until its split-tunneling setting is successfully saved.
 
-Files are kept in `$XDG_DATA_HOME/adarsh.vpn`, normally
-`~/.local/share/adarsh.vpn/`, outside the plugin source directory. Directories
+Files are kept in `$XDG_DATA_HOME/mohankumargupta.vpn`, normally
+`~/.local/share/mohankumargupta.vpn/`, outside the plugin source directory. Directories
 have owner-only permissions (`700`) and files have owner-only read/write
 permissions (`600`). This includes the original `.ovpn`, a working copy,
 referenced certificate/key files, and the remembered profile selection. No

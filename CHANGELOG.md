@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Rename the plugin to `mohankumargupta.vpn`, including its private data
+  directory at `~/.local/share/mohankumargupta.vpn/`.
 - Choose the `.ovpn` file with the panel's own Qt file dialog, dropping the
   `zenity` dependency.
 

@@ -30,7 +30,7 @@ def data_root():
     base = Path(os.environ.get('XDG_DATA_HOME', Path.home() / '.local/share'))
     if not base.is_absolute():
         base = Path.home() / '.local/share'
-    return base / 'adarsh.vpn'
+    return base / 'mohankumargupta.vpn'
 
 
 def private_dir(path):

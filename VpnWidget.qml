@@ -7,8 +7,8 @@ import qs.Ui as Ui
 
 Panel {
   id: root
-  moduleName: "adarsh.vpn"
-  ipcTarget: "adarsh.vpn"
+  moduleName: "mohankumargupta.vpn"
+  ipcTarget: "mohankumargupta.vpn"
   manageIpc: false
   readonly property string helperPath: decodeURIComponent(Qt.resolvedUrl("scripts/vpn.py").toString().replace(/^file:\/\//, ""))
   property string connectionUuid: ""
