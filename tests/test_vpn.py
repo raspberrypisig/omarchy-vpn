@@ -15,8 +15,19 @@ MODULE = Path(__file__).resolve().parents[1] / 'scripts/vpn.py'
 spec = importlib.util.spec_from_file_location('vpn', MODULE)
 vpn = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vpn)
+MISSING_SECRETS = vpn.MISSING_SECRETS
 UUID1 = '11111111-1111-4111-8111-111111111111'
 UUID2 = '22222222-2222-4222-8222-222222222222'
+ASK_STUB = '''#!/usr/bin/python3
+import sys
+for name in ('vpn.secrets.password', 'vpn.secrets.cert-pass'):
+    sys.stdout.write(name + ': ')
+    sys.stdout.flush()
+    sys.stdout.write('<' + sys.stdin.readline().rstrip('\\n') + '>\\n')
+    sys.stdout.flush()
+sys.stdout.write('Error: stub finished\\n')
+sys.exit(4)
+'''
 
 
 class ProfileTests(unittest.TestCase):
@@ -197,6 +208,34 @@ class ProfileTests(unittest.TestCase):
                 vpn.nmcli('connection', 'import')
         self.assertNotIn('private-secret', str(error.exception))
 
+    def test_nm_failure_keeps_the_words_after_a_secret_name(self):
+        detail = vpn.nm_failure("Warning: password for 'vpn.secrets.password' not given in 'passwd-file' and nmcli cannot ask without '--ask' option.")
+        self.assertIn("password for 'vpn.secrets.password' not given", detail)
+
+    def test_missing_secrets_asks_for_a_login_and_is_flagged(self):
+        response = subprocess.CompletedProcess([], 4, '', 'Error: Connection activation failed: No valid secrets')
+        with patch.object(vpn.subprocess, 'run', return_value=response):
+            with self.assertRaises(vpn.VpnError) as error:
+                vpn.nmcli('connection', 'up', 'uuid', UUID1)
+        self.assertTrue(error.exception.needs_secrets)
+        self.assertIn('Enter your VPN login', str(error.exception))
+
+    def test_other_failures_are_not_flagged_as_missing_secrets(self):
+        response = subprocess.CompletedProcess([], 4, '', 'Error: Connection activation failed: No valid secrets')
+        message = vpn.nm_failure('Error: Connection activation failed: Unknown reason')
+        self.assertNotIn('Enter your VPN login', message)
+        self.assertFalse(MISSING_SECRETS.search('Error: Connection activation failed: Unknown reason'))
+        self.assertTrue(MISSING_SECRETS.search(response.stderr))
+
+    def test_pty_reason_is_read_past_the_prompt_it_follows(self):
+        output = ('You need to authenticate to access the Virtual Private Network “probe”.\n'
+                  '\x1b[?2004hCertificate password (vpn.secrets.cert-pass): \x1b[?2004l\r'
+                  'Error: Connection activation failed: Unknown reason\n')
+        message = vpn.nm_failure(output)
+        self.assertIn('Connection activation failed: Unknown reason', message)
+        self.assertNotIn('vpn.secrets.cert-pass', message)
+        self.assertNotIn('\x1b', message)
+
     def test_nm_failure_reports_the_actual_reason(self):
         response = subprocess.CompletedProcess([], 1, '', 'Error: <ca>:error:0480006A:asn1 encoding routines::CMS decryption failed')
         with patch.object(vpn.subprocess, 'run', return_value=response):
@@ -350,6 +389,89 @@ class ProfileTests(unittest.TestCase):
             self.assertTrue(vpn.status(self.root)['splitTunnel'])
         with patch.object(vpn, 'nmcli', side_effect=['', 'no\nno\n']):
             self.assertFalse(vpn.status(self.root)['splitTunnel'])
+
+
+class CredentialsTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.root = self.base / 'data'
+        vpn.private_dir(self.root)
+        vpn.save_state(self.root, {'selected': UUID1, 'profiles': [{'uuid': UUID1, 'name': 'Office VPN'}]})
+
+    def test_secrets_are_read_as_two_lines_and_never_arguments(self):
+        answers = {'vpn.secrets.password': 'first', 'vpn.secrets.cert-pass': 'second'}
+        with patch.object(vpn, 'nmcli_ask', return_value=(0, '')) as ask:
+            vpn.connect_profile(self.root, answers)
+        command = ask.call_args.args[0]
+        self.assertEqual(command, ('connection', 'up', 'uuid', UUID1))
+        self.assertEqual(ask.call_args.args[1], answers)
+        self.assertNotIn('first', repr(ask.call_args))
+
+    def test_read_secrets_takes_a_password_and_an_optional_passphrase(self):
+        with patch('sys.stdin', io.StringIO('hunter2\n\n')):
+            self.assertEqual(vpn.read_secrets(), ('hunter2', ''))
+        with patch('sys.stdin', io.StringIO('hunter2\np12pass\n')):
+            self.assertEqual(vpn.read_secrets(), ('hunter2', 'p12pass'))
+
+    def test_empty_stdin_is_rejected_before_asking(self):
+        with patch('sys.stdin', io.StringIO('')):
+            with self.assertRaises(vpn.VpnError):
+                vpn.read_secrets()
+
+    def test_answered_prompts_reach_nmcli_in_order(self):
+        stub = self.base / 'ask-stub'
+        stub.write_text(ASK_STUB)
+        stub.chmod(0o755)
+        with patch.object(vpn, 'NMCLI', str(stub)):
+            code, output = vpn.nmcli_ask(('connection', 'up', 'uuid', UUID1),
+                                        {'vpn.secrets.password': 'first', 'vpn.secrets.cert-pass': 'second'})
+        self.assertEqual(code, 4)
+        self.assertIn('<first>', output)
+        self.assertIn('<second>', output)
+        self.assertLess(output.index('<first>'), output.index('<second>'))
+
+    def test_unanswered_prompt_is_answered_with_a_blank_line(self):
+        stub = self.base / 'ask-stub'
+        stub.write_text(ASK_STUB)
+        stub.chmod(0o755)
+        with patch.object(vpn, 'NMCLI', str(stub)):
+            code, output = vpn.nmcli_ask(('connection', 'up', 'uuid', UUID1), {'vpn.secrets.password': 'only'})
+        self.assertEqual(code, 4)
+        self.assertIn('<only>', output)
+        self.assertIn('<>', output)
+
+    def test_missing_secrets_after_answering_asks_for_the_login_again(self):
+        with patch.object(vpn, 'nmcli_ask', return_value=(4, 'Error: Connection activation failed: No valid secrets')):
+            with self.assertRaises(vpn.VpnError) as error:
+                vpn.connect_profile(self.root, {'vpn.secrets.password': 'x', 'vpn.secrets.cert-pass': ''})
+        self.assertTrue(error.exception.needs_secrets)
+
+    def test_connect_action_reports_missing_secrets_to_the_widget(self):
+        answers = {'vpn.secrets.password': 'x', 'vpn.secrets.cert-pass': ''}
+        with patch.object(vpn, 'data_root', return_value=self.root), \
+                patch('sys.stdin', io.StringIO('x\n\n')), \
+                patch('sys.argv', ['vpn.py', 'connect-ask']), \
+                patch.object(vpn, 'nmcli_ask', return_value=(4, 'Error: Connection activation failed: No valid secrets')), \
+                io.StringIO() as output, contextlib.redirect_stdout(output):
+            code = vpn.main()
+            printed = json.loads(output.getvalue())
+        self.assertEqual(code, 1)
+        self.assertTrue(printed['needsSecrets'])
+        self.assertEqual(answers['vpn.secrets.cert-pass'], '')
+
+    def test_connect_requires_a_profile_and_respects_pending_routing(self):
+        vpn.save_state(self.root, {'selected': '', 'profiles': []})
+        with patch.object(vpn, 'nmcli') as command:
+            with self.assertRaises(vpn.VpnError):
+                vpn.connect_profile(self.root)
+        command.assert_not_called()
+        vpn.save_state(self.root, {'selected': UUID1, 'profiles': [{'uuid': UUID1, 'name': 'x', 'routingPending': True}]})
+        with patch.object(vpn, 'nmcli') as command:
+            with self.assertRaises(vpn.VpnError):
+                vpn.connect_profile(self.root)
+        command.assert_not_called()
 
 
 if __name__ == '__main__':

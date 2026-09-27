@@ -24,6 +24,7 @@ Panel {
   property string editorName: ""
   property string importPath: ""
   property bool editorExisting: false
+  property string secretPayload: ""
   property var splitTunnel: null
   property bool routingPending: false
   property bool importSplit: true
@@ -51,6 +52,12 @@ Panel {
       routingPending = data.routingPending === true
     }
     if (data.error) lastError = data.error
+    // NetworkManager cannot prompt without a terminal, so a missing-secret
+    // failure opens the login form instead of only reporting the reason.
+    if (data.needsSecrets === true && editorMode === "" && !busy) {
+      editorMode = "credentials"
+      Qt.callLater(root.focusCredentials)
+    }
   }
   function refresh() { if (!poll.running && !busy) poll.running = true }
   function runAction(name, value, label, fullTunnel) {
@@ -97,6 +104,29 @@ Panel {
     desired = !connected
     runAction(desired ? "connect" : "disconnect")
   }
+  function openLogin() {
+    if (busy || !stateKnown || !connectionUuid || routingPending || connected) return
+    lastError = ""
+    editorMode = "credentials"
+    Qt.callLater(focusCredentials)
+  }
+  function focusCredentials() {
+    passwordInput.forceActiveFocus()
+    passwordInput.selectAll()
+  }
+  // The helper reads the two secrets from stdin, never from argv, so they never
+  // appear in the process list or in a shell history.
+  function submitCredentials() {
+    if (busy || passwordInput.text === "") return
+    operation = "connect"
+    desired = true
+    lastError = ""
+    secretPayload = passwordInput.text + "\n" + certificateInput.text + "\n"
+    passwordInput.text = ""
+    certificateInput.text = ""
+    action.command = ["python3", helperPath, "connect-ask"]
+    action.running = true
+  }
   onOpenedChanged: if (opened) refresh(); else if (!busy) editorMode = ""
 
   Timer {
@@ -123,11 +153,19 @@ Panel {
   }
   Process {
     id: action
+    stdinEnabled: true
+    onStarted: {
+      if (root.secretPayload !== "") {
+        write(root.secretPayload)
+        root.secretPayload = ""
+      }
+    }
     stdout: StdioCollector { id: actionOutput; waitForEnd: true }
     onExited: function(code) {
       try {
         root.applyState(JSON.parse(actionOutput.text))
         if (code === 0 && ["import", "rename", "remove"].indexOf(root.operation) !== -1) root.editorMode = ""
+        if (root.operation === "connect" && code === 0) root.editorMode = ""
       } catch (error) { root.lastError = "Unable to run VPN setup. Check the plugin dependencies." }
       Qt.callLater(root.refresh)
     }
@@ -190,7 +228,7 @@ Panel {
             width: parent.width - powerSwitch.width - parent.spacing
             spacing: Style.space(4)
             Text {
-              text: root.editorMode === "import" ? "Add VPN" : root.editorMode === "rename" ? "Rename VPN" : root.editorMode === "remove" ? "Remove VPN" : "VPN"
+              text: root.editorMode === "import" ? "Add VPN" : root.editorMode === "rename" ? "Rename VPN" : root.editorMode === "remove" ? "Remove VPN" : root.editorMode === "credentials" ? "VPN login" : "VPN"
               color: root.foreground
               font.family: Style.font.family
               font.pixelSize: Style.font.body
@@ -198,7 +236,7 @@ Panel {
             }
             Text {
               width: parent.width
-              text: root.editorMode === "" ? root.statusText : root.editorMode === "import" ? "Choose a name you’ll recognize" : root.editorName
+              text: root.editorMode === "" ? root.statusText : root.editorMode === "import" ? "Choose a name you’ll recognize" : root.editorMode === "credentials" ? root.selectedName : root.editorName
               textFormat: Text.PlainText
               elide: Text.ElideRight
               color: root.connected && root.editorMode === "" ? Color.accent : Qt.darker(root.foreground, 1.35)
@@ -293,6 +331,7 @@ Panel {
                     anchors.rightMargin: Style.space(6)
                     anchors.verticalCenter: parent.verticalCenter
                     spacing: Style.space(4)
+                    PanelActionButton { iconText: "󰌢"; tooltipText: "Enter VPN login"; focusable: true; enabled: !root.busy && !root.connected; foreground: root.foreground; onClicked: root.openLogin() }
                     PanelActionButton { iconText: "󰏫"; tooltipText: "Rename VPN"; focusable: true; enabled: !root.busy; foreground: root.foreground; onClicked: root.editProfile(profileRow.modelData, "rename") }
                     PanelActionButton { iconText: "󰆴"; tooltipText: "Remove VPN"; focusable: true; enabled: !root.busy; foreground: root.foreground; hoverColor: Color.urgent; onClicked: root.editProfile(profileRow.modelData, "remove") }
                   }
@@ -340,6 +379,63 @@ Panel {
             spacing: Style.space(8)
             Ui.Button { width: (parent.width - parent.spacing) / 2; text: "Cancel"; bordered: true; focusable: true; enabled: !root.busy; onClicked: root.editorMode = "" }
             Ui.Button { width: (parent.width - parent.spacing) / 2; text: root.editorMode === "import" ? "Save VPN" : "Save name"; bordered: true; focusable: true; foreground: Color.accent; enabled: !root.busy && nameInput.text.trim() !== ""; opacity: enabled ? 1 : 0.4; onClicked: root.saveEditor() }
+          }
+        }
+        Column {
+          visible: root.editorMode === "credentials"
+          width: parent.width
+          spacing: Style.space(10)
+          Ui.TextField {
+            id: passwordInput
+            width: parent.width
+            password: true
+            placeholderText: "VPN password"
+            maximumLength: 128
+            enabled: !root.busy
+            onAccepted: root.submitCredentials()
+          }
+          Ui.TextField {
+            id: certificateInput
+            width: parent.width
+            password: true
+            placeholderText: "Certificate passphrase (optional)"
+            maximumLength: 128
+            enabled: !root.busy
+            onAccepted: root.submitCredentials()
+          }
+          Text {
+            width: parent.width
+            text: "Your login goes straight to NetworkManager. It is never written to this plugin’s files or passed on the command line. Leave the passphrase blank unless your certificate asks for one."
+            wrapMode: Text.WordWrap
+            color: Qt.darker(root.foreground, 1.35)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+          }
+          Row {
+            width: parent.width
+            spacing: Style.space(8)
+            Ui.Button {
+              width: (parent.width - parent.spacing) / 2
+              text: "Cancel"
+              bordered: true
+              focusable: true
+              enabled: !root.busy
+              onClicked: {
+                root.editorMode = ""
+                passwordInput.text = ""
+                certificateInput.text = ""
+              }
+            }
+            Ui.Button {
+              width: (parent.width - parent.spacing) / 2
+              text: "Connect"
+              bordered: true
+              focusable: true
+              foreground: Color.accent
+              enabled: !root.busy && passwordInput.text !== ""
+              opacity: enabled ? 1 : 0.4
+              onClicked: root.submitCredentials()
+            }
           }
         }
         Column {

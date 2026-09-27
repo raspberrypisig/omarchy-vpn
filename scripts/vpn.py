@@ -6,10 +6,13 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unicodedata
 
 
@@ -22,14 +25,21 @@ INLINE_OPTIONS = FILE_OPTIONS | {'auth-gen-token-secret'}
 MAX_FILE_BYTES = 16 * 1024 * 1024
 GENERIC_FAILURE = 'NetworkManager could not complete the request. Check the VPN file, permissions, and any required login credentials.'
 MISSING_OPENVPN = re.compile(r'unknown VPN plugin "org\.freedesktop\.NetworkManager\.openvpn"')
+MISSING_SECRETS = re.compile(r'No valid secrets')
+ANSI = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
 PEM_BLOCK = re.compile(r'-{4,}.*?-{4,}')
-SECRET_ASSIGNMENT = re.compile(r'(?i)\b(pass(?:word|phrase)?|secret|token|pin|credential)s?\b\s*[:=]?\s*"?([^\s"]+)"?')
+# Only an explicit separator marks a value, so prose like "password for
+# 'vpn.secrets.password' not given" keeps its words instead of being eaten.
+SECRET_ASSIGNMENT = re.compile(r'(?i)\b(pass(?:word|phrase)?|secret|token|pin|credential)s?\b\s*[:=]\s*"?([^\s"]+)"?')
 OPAQUE_TOKEN = re.compile(r'[A-Za-z0-9+/=_-]{24,}')
 MAX_DETAIL = 160
+NMCLI = 'nmcli'
 
 
 class VpnError(Exception):
-    pass
+    def __init__(self, message, needs_secrets=False):
+        super().__init__(message)
+        self.needs_secrets = needs_secrets
 
 
 def data_root():
@@ -93,28 +103,36 @@ def save_state(root, state):
 
 def nm_failure(output):
     # nmcli can quote the parsed configuration or a credential back at us, so
-    # only the first line survives and every opaque run is redacted.
-    for line in (output or '').splitlines():
-        detail = line.strip()
-        if detail:
-            break
-    else:
+    # only the reason survives and every opaque run is redacted. Output read
+    # from a pty also carries terminal escapes and a preamble.
+    text = ANSI.sub('', output or '')
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
         return GENERIC_FAILURE
-    if MISSING_OPENVPN.search(output):
+    if MISSING_OPENVPN.search(text):
         return 'NetworkManager has no OpenVPN support installed. On Arch install networkmanager-openvpn, then try again.'
-    detail = PEM_BLOCK.sub('[redacted]', detail)
+    # A pty leaves the prompt and the error on one line, so take the reason
+    # from wherever the Error: marker appears rather than the whole line.
+    reason = next((line[line.index('Error:'):] for line in lines if 'Error:' in line), lines[0])
+    detail = PEM_BLOCK.sub('[redacted]', reason)
     detail = SECRET_ASSIGNMENT.sub(lambda match: match.group(1) + '=[redacted]', detail)
     detail = OPAQUE_TOKEN.sub('[redacted]', detail)
     detail = detail.removeprefix('**nmcli**').removeprefix('Error:').strip()
     if len(detail) > MAX_DETAIL:
         detail = detail[:MAX_DETAIL].rstrip() + '…'
-    return f'NetworkManager rejected this request: {detail}' if detail else GENERIC_FAILURE
+    if not detail:
+        return GENERIC_FAILURE
+    if MISSING_SECRETS.search(text):
+        # nmcli cannot prompt without a terminal, so the widget collects the
+        # secrets itself and answers --ask over a pty.
+        return f'{detail.rstrip(".")}. Enter your VPN login to continue.'
+    return f'NetworkManager rejected this request: {detail}'
 
 
 def nmcli(*args, timeout=40):
     try:
         result = subprocess.run(
-            ['nmcli', '--wait', '30', *args], capture_output=True,
+            [NMCLI, '--wait', '30', *args], capture_output=True,
             text=True, timeout=timeout, env=dict(os.environ, LC_ALL='C'),
         )
     except FileNotFoundError:
@@ -122,8 +140,65 @@ def nmcli(*args, timeout=40):
     except subprocess.TimeoutExpired:
         raise VpnError('NetworkManager timed out. Check its connection list before trying again.') from None
     if result.returncode:
-        raise VpnError(nm_failure(result.stderr or result.stdout))
+        message = nm_failure(result.stderr or result.stdout)
+        raise VpnError(message, needs_secrets=bool(MISSING_SECRETS.search(result.stderr or '')))
     return result.stdout
+
+
+def nmcli_ask(args, answers, timeout=90):
+    # nmcli only prompts for secrets with --ask on a terminal, and it refuses
+    # to store them any other way, so answer its own prompts over a pty. The
+    # secrets reach nmcli through this pipe and never appear in argv.
+    controller, terminal = os.openpty()
+    try:
+        try:
+            process = subprocess.Popen(
+                [NMCLI, '--ask', '--wait', '30', *args], stdin=terminal,
+                stdout=terminal, stderr=terminal, close_fds=True,
+                env=dict(os.environ, LC_ALL='C'),
+            )
+        except FileNotFoundError:
+            raise VpnError('nmcli is missing. Run the plugin dependency setup first.') from None
+        finally:
+            os.close(terminal)
+        collected = []
+        pending = dict(answers)
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.wait(timeout=5)
+                raise VpnError('NetworkManager timed out while asking for your VPN login.')
+            if not select.select([controller], [], [], min(remaining, 0.5))[0]:
+                continue
+            try:
+                chunk = os.read(controller, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            text = chunk.decode('utf-8', 'replace')
+            collected.append(text)
+            for name in [key for key in pending if key in text]:
+                os.write(controller, pending.pop(name).encode() + b'\n')
+        for name in pending:
+            # A secret left blank is a legitimate answer for an unused field.
+            try:
+                os.write(controller, b'\n')
+            except OSError:
+                break
+        while select.select([controller], [], [], 0.5)[0]:
+            try:
+                chunk = os.read(controller, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            collected.append(chunk.decode('utf-8', 'replace'))
+        return process.wait(timeout=5), ''.join(collected)
+    finally:
+        os.close(controller)
 
 
 def archive_config(source, destination):
@@ -199,6 +274,37 @@ def prune_orphans(root, state):
             shutil.rmtree(entry, ignore_errors=True)
             removed.append(entry.name)
     return removed
+
+
+def read_secrets():
+    # Two lines on stdin: the VPN password, then the optional passphrase for
+    # the certificate or pkcs12 file.
+    password = sys.stdin.readline()
+    if not password:
+        raise VpnError('Enter your VPN password to continue.')
+    return password.rstrip('\n'), sys.stdin.readline().rstrip('\n')
+
+
+def connect_profile(root, answers=None):
+    state = load_state(root)
+    if not state['selected']:
+        raise VpnError('Import a VPN profile first.')
+    if any(item['uuid'] == state['selected'] and item.get('routingPending', False) for item in state['profiles']):
+        raise VpnError('Set the split-tunneling option before connecting this imported profile.')
+    command = ('connection', 'up', 'uuid', state['selected'])
+    if answers is None:
+        nmcli(*command)
+        return
+    code, output = nmcli_ask(command, answers)
+    if code:
+        raise VpnError(nm_failure(output), needs_secrets=bool(MISSING_SECRETS.search(output)))
+
+
+def disconnect_profile(root):
+    state = load_state(root)
+    if not state['selected']:
+        raise VpnError('Import a VPN profile first.')
+    nmcli('connection', 'down', 'uuid', state['selected'])
 
 
 def profile_name(name):
@@ -338,7 +444,7 @@ def status(root):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['status', 'import', 'select', 'rename', 'remove', 'reset', 'sweep', 'set-split', 'connect', 'disconnect'])
+    parser.add_argument('action', choices=['status', 'import', 'select', 'rename', 'remove', 'reset', 'sweep', 'set-split', 'connect', 'connect-ask', 'disconnect'])
     parser.add_argument('value', nargs='?')
     parser.add_argument('--name')
     parser.add_argument('--full-tunnel', action='store_true', help='Allow the VPN to supply the default internet route')
@@ -366,13 +472,13 @@ def main():
                 removed = sweep_profiles(root)
             elif args.action == 'set-split':
                 configure_split(root, args.value, not args.full_tunnel)
-            elif args.action in {'connect', 'disconnect'}:
-                state = load_state(root)
-                if not state['selected']:
-                    raise VpnError('Import a VPN profile first.')
-                if args.action == 'connect' and any(item['uuid'] == state['selected'] and item.get('routingPending', False) for item in state['profiles']):
-                    raise VpnError('Set the split-tunneling option before connecting this imported profile.')
-                nmcli('connection', 'up' if args.action == 'connect' else 'down', 'uuid', state['selected'])
+            elif args.action == 'connect':
+                connect_profile(root)
+            elif args.action == 'connect-ask':
+                password, certificate = read_secrets()
+                connect_profile(root, {'vpn.secrets.password': password, 'vpn.secrets.cert-pass': certificate})
+            elif args.action == 'disconnect':
+                disconnect_profile(root)
             result = status(root)
             if removed:
                 result['swept'] = removed
@@ -380,7 +486,7 @@ def main():
         return 0
     except (VpnError, OSError) as exc:
         message = str(exc) if isinstance(exc, VpnError) else 'Unable to read or save VPN files. Check file access and available disk space.'
-        print(json.dumps({'error': message}))
+        print(json.dumps({'error': message, 'needsSecrets': isinstance(exc, VpnError) and exc.needs_secrets}))
         return 1
 
 
